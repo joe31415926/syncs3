@@ -301,7 +301,7 @@ int add_string_to_string_array(const char *thestr, char **b, int *bl, int *bs)
     return offset;
 }
 
-char *read_into_buffer(int fd, int buf_idx)
+char *read_into_buffer(int fd, int buf_idx, const char *log_label)
 {
     buffer_t *buf = bufs + buf_idx;
     buf->buf_len = 0;
@@ -330,8 +330,16 @@ char *read_into_buffer(int fd, int buf_idx)
         }
     }
     my_assert(r == 0, "read from process stdout");
-    close(fd);
     
+    int wstatus;
+    char logline[1000];
+    snprintf(logline, sizeof(logline), "wait %s failed", log_label);
+    my_assert(wait(&wstatus) > 0, log_label);
+    snprintf(logline, sizeof(logline), "%s didn't exit with 0 status", log_label);
+    my_assert(wstatus == 0, log_label);
+    my_assert(read(fd, logline, 1) == 0, "dead process stdout no longer at EOF??");
+    close(fd);
+
     return buf->buf;
 }
 
@@ -344,23 +352,20 @@ void list_100_s3_objects(char *NextToken)
     my_assert(pid != -1, "fork");
     if (pid == 0)
     {        
-        dup2 (link[1], STDOUT_FILENO);
         close(link[0]);
-        close(link[1]);
+        dup2 (link[1], STDOUT_FILENO);
         
         if (NextToken[0])
             execlp("/usr/bin/aws", "/usr/bin/aws", "s3api", "list-objects", "--bucket", bucket, "--output", "json", "--max-items", "100", "--starting-token", NextToken, "--prefix", prefix, (char *)0);
         else
             execlp("/usr/bin/aws", "/usr/bin/aws", "s3api", "list-objects", "--bucket", bucket, "--output", "json", "--max-items", "100", "--prefix", prefix, (char *)0);
 
+        my_assert(1, "execlp returned list_100_s3_objects");
         exit(-1);
     }
-    
     close(link[1]);
-    
-    // just read in stdout from process
-    read_into_buffer(link[0], stdout_buffer);
-    
+    read_into_buffer(link[0], stdout_buffer, "list_100_s3_objects");
+
     strcpy(NextToken, "");
     if (strstr(bufs[stdout_buffer].buf, "{"))
     {
@@ -377,7 +382,7 @@ void list_100_s3_objects(char *NextToken)
         if (NextToken[0])
             write_a_log_line("parsed json from batch of objects");
         else
-            write_a_log_line("parsed json from batch of objects (last)");        
+            write_a_log_line("parsed json from batch of objects (last batch because there was no NextToken)");        
     }
     else
     {
@@ -399,21 +404,17 @@ void put_s3_object(const char *key, const char *infile)
     my_assert(pid != -1, "fork");
     if (pid == 0)
     {        
-        dup2 (link[1], STDOUT_FILENO);
         close(link[0]);
-        close(link[1]);
+        dup2 (link[1], STDOUT_FILENO);
         
         execlp("/usr/bin/aws", "/usr/bin/aws", "s3api", "put-object", "--bucket", bucket, "--output", "json", "--key", complete_key, "--body", infile, (char *)0);
+        my_assert(1, "execlp returned put_s3_object");
         exit(-1);
     }
-    else
-    {
-        close(link[1]);
-        
-        char *temp_buffer = read_into_buffer(link[0], stdout_buffer);
-        
+    close(link[1]);
+    char *temp_buffer = read_into_buffer(link[0], stdout_buffer, "put_s3_object");
+
 //        printf("put ->%s<-\n", temp_buffer);
-    }
 }
 
 void get_s3_object(const char *key, const char *outfile)
@@ -430,22 +431,17 @@ void get_s3_object(const char *key, const char *outfile)
     my_assert(pid != -1, "fork");
     if (pid == 0)
     {        
-        dup2 (link[1], STDOUT_FILENO);
         close(link[0]);
-        close(link[1]);
+        dup2 (link[1], STDOUT_FILENO);
         
         execlp("/usr/bin/aws", "/usr/bin/aws", "s3api", "get-object", "--bucket", bucket, "--output", "json", "--key", complete_key, outfile, (char *)0);
-
+        my_assert(1, "execlp returned get_s3_object");
         exit(-1);
     }
-    else
-    {
-        close(link[1]);
-        
-        char *temp_buffer = read_into_buffer(link[0], stdout_buffer);
+    close(link[1]);
+    char *temp_buffer = read_into_buffer(link[0], stdout_buffer, "get_s3_object");
         
 //        printf("get ->%s<-\n", temp_buffer);
-    }
 }
 
 int get_missing_files()
@@ -469,9 +465,9 @@ int get_missing_files()
     }
     
     if (something_was_fetched)
-        write_a_log_line("get_missing_files - something_was_fetched");
+        write_a_log_line("get_missing_files: something_was_fetched - we should check again..");
     else
-        write_a_log_line("get_missing_files - something_was NOT fetched");
+        write_a_log_line("get_missing_files: there were no missing files!");
 
     
     return something_was_fetched;
@@ -580,10 +576,10 @@ void upload_to_s3_and_download_from_s3(void)
             strcpy(down_pathname, download_path);
             strcat(down_pathname, de->d_name);
             
-            printf("upload_to_s3_and_download_from_s3 %s\n", up_pathname);
+//            printf("upload_to_s3_and_download_from_s3 %s\n", up_pathname);
             if (files_not_equal(up_pathname, down_pathname))
             {
-                printf("not equal\n");
+//                printf("not equal\n");
                 put_s3_object(de->d_name, up_pathname);
                 get_s3_object(de->d_name, down_pathname);
             }
