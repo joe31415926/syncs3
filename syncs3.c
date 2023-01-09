@@ -70,10 +70,11 @@ typedef struct {
     int size_s3;    // the size in s3;
     int size_up;    // the size in upload directory;
     int size_down;    // the size in download directory;
+    time_t mod_time; // Time of last modification in upload directory
     int wd; // inotify watch descriptor 
 } obj_t;
 
-int upload_path_wd; // inotify watch descriptor
+int upload_path_wd = -1; // inotify watch descriptor
 
 obj_t *obj(const char *name)
 {
@@ -108,6 +109,7 @@ obj_t *obj(const char *name)
     new_object.size_s3 = -1;
     new_object.size_up = -1;
     new_object.size_down = -1;
+    new_object.mod_time = 0;
     new_object.wd = -1;
     
     // save the new object
@@ -494,21 +496,37 @@ int start_watching_upload_files(void)
     DIR *dd = opendir(upload_path);
     my_assert(dd != NULL, "opendir");
     
+    my_assert(upload_path_wd == -1, "upload_path_wd == -1");
     upload_path_wd = inotify_add_watch(fd_inotify, upload_path, IN_CREATE);
     my_assert(upload_path_wd > 0, "inotify_add_watch upload_path");
 
+    time_t now = time(NULL);
+    
     struct dirent *de;
     while ((de = readdir(dd)) != NULL)
     {
         if (de->d_name[0] != '.')
         {
-            char pathname[1000];
-            strcpy(pathname, upload_path);
-            strcat(pathname, de->d_name);
+            time_t last_modification_time = obj(de->d_name)->mod_time;
             
-            int wd = inotify_add_watch(fd_inotify, pathname, IN_MODIFY);
-            my_assert(wd > 0, "inotify_add_watch individual file");
-            obj(de->d_name)->wd = wd;
+            if ((last_modification_time == 0) || (now < last_modification_time) || (now - last_modification_time < 30 * 24 * 60 * 60))
+            {
+                char pathname[1000];
+                strcpy(pathname, upload_path);
+                strcat(pathname, de->d_name);
+                
+                my_assert(obj(de->d_name)->wd == -1, "obj(de->d_name)->wd == -1");
+                int wd = inotify_add_watch(fd_inotify, pathname, IN_MODIFY);
+                if (wd <= 0)
+                {
+                    write_a_log_line("inotify_add_watch failed");
+                    char logline[999];
+                    sprintf(logline, "%d for %s", wd, pathname);
+                    write_a_log_line(logline);
+                }
+                my_assert(wd > 0, "inotify_add_watch individual file");
+                obj(de->d_name)->wd = wd;
+            }
         }
     }
     my_assert(closedir(dd) == 0, "closedir");
@@ -540,22 +558,26 @@ char *read_file_into_buffer(int fd, ssize_t toread, int buf_idx)
 }
 
 
-int files_not_equal(const char *a, const char *b)
+int files_not_equal(const char *d_name, const char *up_pathname, const char *down_pathname)
 {
-    struct stat statbufa;
-    struct stat statbufb;
-    if (stat(a, &statbufa) != 0) return 1;
-    if (stat(b, &statbufb) != 0) return 1;
-    if (statbufa.st_size != statbufb.st_size) return 1;
+    struct stat statbufup;
+    struct stat statbufdown;
+    if (stat(up_pathname, &statbufup) != 0) return 1;
+    if (stat(down_pathname, &statbufdown) != 0) return 1;
+
+    obj(d_name)->mod_time = statbufup.st_mtime;
+
+    if (statbufup.st_size != statbufdown.st_size) return 1;
     
-    int fda = open(a, O_RDONLY);
-    int fdb = open(b, O_RDONLY);
+    
+    int fda = open(up_pathname, O_RDONLY);
+    int fdb = open(down_pathname, O_RDONLY);
     my_assert(fda > 0 && fdb > 0, "open in files_not_equal");
     
-    char *buffa = read_file_into_buffer(fda, statbufa.st_size, fileA_buffer);
-    char *buffb = read_file_into_buffer(fdb, statbufa.st_size, fileB_buffer);
+    char *buffa = read_file_into_buffer(fda, statbufup.st_size, fileA_buffer);
+    char *buffb = read_file_into_buffer(fdb, statbufup.st_size, fileB_buffer);
         
-    return memcmp(buffa, buffb, statbufa.st_size) ? 1 : 0;
+    return memcmp(buffa, buffb, statbufup.st_size) ? 1 : 0;
 }
 
 void upload_to_s3_and_download_from_s3(void)
@@ -577,7 +599,7 @@ void upload_to_s3_and_download_from_s3(void)
             strcat(down_pathname, de->d_name);
             
 //            printf("upload_to_s3_and_download_from_s3 %s\n", up_pathname);
-            if (files_not_equal(up_pathname, down_pathname))
+            if (files_not_equal(de->d_name, up_pathname, down_pathname))
             {
 //                printf("not equal\n");
                 put_s3_object(de->d_name, up_pathname);
@@ -605,7 +627,18 @@ void wait_for_file_to_change(int fd_inotify)
     {
         obj_t *obj_ptr = ((obj_t *) (bufs[object_buffer].buf + i * sizeof(obj_t)));
         if (obj_ptr->wd != -1)
-            my_assert(inotify_rm_watch(fd_inotify, obj_ptr->wd) == 0, "inotify_rm_watch");
+        {
+            int result = inotify_rm_watch(fd_inotify, obj_ptr->wd);
+            if (result != 0)
+            {
+                write_a_log_line("inotify_rm_watch failed");
+                char logline[999];
+                sprintf(logline, "%d for %s", result, bufs[string_buffer].buf + obj_ptr->name_off);
+                write_a_log_line(logline);
+            }
+            my_assert(result == 0, "inotify_rm_watch");
+            
+        }
         obj_ptr->wd = -1;
     }
     my_assert(close(fd_inotify) == 0, "close fd_inotify");
