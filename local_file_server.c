@@ -25,9 +25,27 @@
 char *buffers[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS] = {NULL};
 int bytes_to_send[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS] = {0};
 int buffer_size[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS] = {0};
-    
+struct pollfd fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 2];
 
-char path[100];
+char upload_path[100];
+char logfile_path[100];
+
+void write_a_log_line(const char *mess)
+{
+    FILE *logfile = fopen(logfile_path, "a+");
+    assert(logfile);
+    fprintf(logfile, "%ld %s\n", time(NULL), mess);
+    fclose(logfile);
+}
+
+void my_assert(int cond, const char *mess)
+{
+    if (!cond)
+    {
+        write_a_log_line(mess);
+        exit(-1);
+    }
+}
 
 struct {
     char d_name[256];
@@ -38,11 +56,38 @@ struct {
 } *file_records = NULL;
 int num_file_records = 0;
 
+void broadcast_out(int only_one, const char *buf, off_t st_size)
+{
+    if (buf && st_size)
+    {
+        int i;
+        int start = 0;
+        int end = MAXIMUM_NUMBER_OF_CLIENT_LISTENERS;
+        if (only_one != -1)
+        {
+            start = only_one;
+            end = only_one + 1;
+        }
+        for (i = start; i < end; i++)
+            if (fds[i].fd != -1)
+            {
+                if (bytes_to_send[i] + st_size > buffer_size[i])
+                {
+                    buffer_size[i] = bytes_to_send[i] + st_size;
+                    buffers[i] = realloc(buffers[i], buffer_size[i]);
+                    my_assert(buffers[i] != NULL, "realloc buffers");
+                }
+                memcpy(buffers[i] + bytes_to_send[i], buf, st_size);
+                bytes_to_send[i] += st_size;
+            }
+    }
+}
+
 void grow_files_records_by_one()
 {
     num_file_records++;
     file_records = realloc(file_records, num_file_records * sizeof(file_records[0]));
-    assert(file_records);
+    my_assert(file_records != NULL, "realloc file_records");
     file_records[num_file_records - 1].wd = 0;
     file_records[num_file_records - 1].mod_time = 0;
     file_records[num_file_records - 1].buf = NULL;
@@ -63,87 +108,13 @@ int get_index(const char *d_name)
     return i;
 }
 
-void start_watching_files(int *fd, int *path_inotify)
-{
-    assert(*fd == -1);
-    *fd = inotify_init();
-    assert(*fd != -1);
-    
-    assert(*path_inotify == 0);
-    *path_inotify = inotify_add_watch(*fd, path, IN_CREATE);
-    assert(*path_inotify > 0);
-    
-    DIR *dd = opendir(path);
-    assert(dd != NULL);
-    
-    time_t now = time(NULL);
-    
-    struct dirent *de;
-    while ((de = readdir(dd)) != NULL)
-        if (de->d_name[0] != '.')
-        {
-            int idx = get_index(de->d_name);
-            
-            if ((file_records[idx].mod_time == 0) || (now < file_records[idx].mod_time) || (now - file_records[idx].mod_time < 30 * 24 * 60 * 60))
-            {
-                char fullpath[1000];
-                strcpy(fullpath, path);
-                strcat(fullpath, de->d_name);
-                    
-                file_records[idx].wd = inotify_add_watch(*fd, fullpath, IN_MODIFY);
-                if (file_records[idx].wd <= 0)
-                {
-                    printf("inotify_add_watch failed\n");
-                    printf("%d for %s\n", file_records[idx].wd, fullpath);
-                    printf("errno: %d\n", errno);
-                    if (errno == EACCES) printf("EACCES\n");
-                    if (errno == EBADF) printf("EBADF\n");
-                    if (errno == EFAULT) printf("EFAULT\n");
-                    if (errno == EINVAL) printf("EINVAL\n");
-                    if (errno == ENAMETOOLONG) printf("ENAMETOOLONG\n");
-                    if (errno == ENOENT) printf("ENOENT\n");
-                    if (errno == ENOMEM) printf("ENOMEM\n");
-                    if (errno == ENOSPC) printf("ENOSPC\n");
-                }
-                assert(file_records[idx].wd > 0);
-            }
-        }
-    assert(closedir(dd) == 0);
-}
-
-void stop_watching_files(int *fd, int *path_inotify)
-{
-    struct inotify_event event[100];
-    assert(*fd != -1);
-    assert(read(*fd, &event, sizeof(event)) > 0);
-    
-    // igore the actual event. Just reset everything...
-    
-    assert(*path_inotify > 0);
-    assert(inotify_rm_watch(*fd, *path_inotify) == 0);
-    *path_inotify = 0;
-    
-    int idx;
-    for (idx = 0; idx < num_file_records; idx++)
-    {
-        // a file could have been added by read_all_files_into_memory() since the last start_watching_files()
-        if (file_records[idx].wd > 0)
-        {
-            assert(inotify_rm_watch(*fd, file_records[idx].wd) == 0);
-            file_records[idx].wd = 0;
-        }
-    }
-    assert(close(*fd) == 0);
-    *fd = -1;
-}
-
 void read_all_files_into_memory()
 {
-    int dirfd = open(path, O_RDONLY);
-    assert(dirfd > 0);
+    int dirfd = open(upload_path, O_RDONLY);
+    my_assert(dirfd > 0, "read_all_files_into_memory open");
     
-    DIR *dd = opendir(path);
-    assert(dd != NULL);
+    DIR *dd = opendir(upload_path);
+    my_assert(dd != NULL, "read_all_files_into_memory opendir");
     
     struct dirent *de;
     while ((de = readdir(dd)) != NULL)
@@ -152,62 +123,46 @@ void read_all_files_into_memory()
             int idx = get_index(de->d_name);
             
             struct stat statbuf;
-            assert(fstatat(dirfd, de->d_name, &statbuf, 0) == 0);
+            my_assert(fstatat(dirfd, de->d_name, &statbuf, 0) == 0, "read_all_files_into_memory fstatat");
             file_records[idx].mod_time = statbuf.st_mtime;
             
-            // a file could have been added by start_watching_files() since the last read_all_files_into_memory() 
             if (file_records[idx].buf == NULL || file_records[idx].st_size < statbuf.st_size)
             {
                 file_records[idx].st_size = statbuf.st_size;
                 file_records[idx].buf = realloc(file_records[idx].buf, file_records[idx].st_size);
-                assert(file_records[idx].buf);
+                my_assert(file_records[idx].buf != NULL, "read_all_files_into_memory realloc file_records");
                 
                 int fd = openat(dirfd, de->d_name, O_RDONLY);
-                assert(fd > 0);
+                my_assert(fd > 0, "read_all_files_into_memory openat");
                 
                 ssize_t bytes_to_read = file_records[idx].st_size;
                 while (bytes_to_read)
                 {
                     ssize_t bytes_read_this_time = read(fd, file_records[idx].buf + file_records[idx].st_size - bytes_to_read, bytes_to_read);
-                    assert(bytes_read_this_time > 0);
+                    my_assert(bytes_read_this_time > 0, "read_all_files_into_memory read");
                     bytes_to_read -= bytes_read_this_time;
                 }
                 close(fd);
                 
                 // OK, this is a new file which has been read into memory. Send this to ALL open connections
-                int i;
-                for (i = 0; i < MAXIMUM_NUMBER_OF_CLIENT_LISTENERS; i++)
-                {
-                    if (bytes_to_send[i] + file_records[idx].st_size > buffer_size[i])
-                    {
-                        buffer_size[i] = bytes_to_send[i] + file_records[idx].st_size;
-                        buffers[i] = realloc(buffers[i], buffer_size[i]);
-                        assert(buffers[i]);
-                    }
-                    memcpy(buffers[i] + bytes_to_send[i], file_records[idx].buf, file_records[idx].st_size);
-                    bytes_to_send[i] += file_records[idx].st_size;
-                }
-
+                broadcast_out(-1, file_records[idx].buf, file_records[idx].st_size);
             }
 
         }
-    assert(closedir(dd) == 0);
+    my_assert(closedir(dd) == 0, "read_all_files_into_memory closedir");
     
     close(dirfd);
 }
 
 int child()
 {
-    int path_inotify = 0;
-    struct pollfd fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 2];
-
+    write_a_log_line("child start");
     int i;
     for (i = 0; i < MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 2; i++)
         fds[i].fd = -1;
     
     fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].fd = socket(AF_INET, SOCK_STREAM, 0);
-    fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].events = POLLIN;
-    assert(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].fd != -1);
+    my_assert(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].fd != -1, "socket");
 
 
     struct sockaddr_in addr = {0};
@@ -217,79 +172,93 @@ int child()
     int yes = 1;
     
     addr.sin_port = htons(5874);
-    assert(setsockopt(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) != -1);
-    assert(bind(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].fd, (struct sockaddr *) &addr,  sizeof(addr)) == 0);
-    assert(listen(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].fd, 5) == 0);
+    my_assert(setsockopt(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) != -1, "setsockopt");
+    my_assert(bind(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].fd, (struct sockaddr *) &addr,  sizeof(addr)) == 0, "bind");
+    my_assert(listen(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].fd, 5) == 0, "listen");
 
-    start_watching_files(&fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].fd, &path_inotify);
-    fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].events = POLLIN;
+    fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].fd = inotify_init1(IN_NONBLOCK);
+    my_assert(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].fd != -1, "inotify_init1");
+    my_assert(inotify_add_watch(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].fd, upload_path, IN_CREATE | IN_MOVED_TO | IN_MODIFY | IN_MASK_ADD) > 0, "inotify_add_watch");
     
     read_all_files_into_memory();
+    write_a_log_line("loop start");
     while (1)
     {
         for (i = 0; i < MAXIMUM_NUMBER_OF_CLIENT_LISTENERS; i++)
             fds[i].events = POLLIN | (bytes_to_send[i] ? POLLOUT : 0);
+        fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].events = POLLIN;
+        fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].events = POLLIN;
 
-        assert(poll(fds, MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 2, -1) > 0);
+        my_assert(poll(fds, MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 2, -1) > 0, "poll");
         
         for (i = 0; i < MAXIMUM_NUMBER_OF_CLIENT_LISTENERS; i++)
-        if (fds[i].revents)
+        if (fds[i].fd != -1 && fds[i].revents)
         {
-            if (fds[i].revents == POLLOUT)
+            if (fds[i].revents & POLLOUT)
             {
                 ssize_t bytes_sent = send(fds[i].fd, buffers[i], bytes_to_send[i], 0);
-                assert(bytes_sent > 0);
+                my_assert(bytes_sent > 0, "send");
                 bytes_to_send[i] -= bytes_sent;
                 memmove(buffers[i], buffers[i] + bytes_sent, bytes_to_send[i]);
             }
-            if (fds[i].revents == POLLIN)
+            if (fds[i].revents & POLLIN)
             {
+                write_a_log_line("remote client closed conection");
                 close(fds[i].fd);
                 fds[i].fd = -1;
             }
+            if (fds[i].revents & ( ~ (POLLOUT | POLLIN) ) )
+                write_a_log_line("remote client conection revents something other than POLLIN or POLLOUT");
         }
 
-        if (fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].revents == POLLIN)
+        if (fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].revents)
         {
-            for (i = 0; i < MAXIMUM_NUMBER_OF_CLIENT_LISTENERS; i++)
-                if (fds[i].fd == -1)
-                    break;
-            assert(i != MAXIMUM_NUMBER_OF_CLIENT_LISTENERS);
-                    
-            fds[i].fd = accept(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].fd, NULL, NULL);
-            assert(fds[i].fd > 1);
-            
-            bytes_to_send[i] = 0;
-            // start by sending ALL the file contents!
-            int idx;
-            for (idx = 0; idx < num_file_records; idx++)
-                if (file_records[idx].buf && file_records[idx].st_size)
-                {
-                    if (bytes_to_send[i] + file_records[idx].st_size > buffer_size[i])
-                    {
-                        buffer_size[i] = bytes_to_send[i] + file_records[idx].st_size;
-                        buffers[i] = realloc(buffers[i], buffer_size[i]);
-                        assert(buffers[i]);
-                    }
-                    memcpy(buffers[i] + bytes_to_send[i], file_records[idx].buf, file_records[idx].st_size);
-                    bytes_to_send[i] += file_records[idx].st_size;
-                }
+            if (fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].revents == POLLIN)
+            {
+                write_a_log_line("accept listener");
+                for (i = 0; i < MAXIMUM_NUMBER_OF_CLIENT_LISTENERS; i++)
+                    if (fds[i].fd == -1)
+                        break;
+                my_assert(i != MAXIMUM_NUMBER_OF_CLIENT_LISTENERS, "ran out of space for new listeners");
+                        
+                fds[i].fd = accept(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 0].fd, NULL, NULL);
+                my_assert(fds[i].fd > 1, "accept");
+                
+                bytes_to_send[i] = 0;
+                // start by sending ALL the file contents!
+                int idx;
+                for (idx = 0; idx < num_file_records; idx++)
+                    broadcast_out(i, file_records[idx].buf, file_records[idx].st_size);
+            }
+            else
+                write_a_log_line("listen revents != POLLIN");
         }
         
-        if (fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].revents == POLLIN)
+        if (fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].revents)
         {
-            stop_watching_files(&fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].fd, &path_inotify);
-            // is there a race condition here where a new file may go unnoticed?
-            start_watching_files(&fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].fd, &path_inotify);
-            read_all_files_into_memory();
+            if (fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].revents == POLLIN)
+            {
+                struct inotify_event event[sizeof(struct inotify_event) + NAME_MAX + 1];
+                ssize_t len = 1;
+                while (len > 0)
+                {
+                    len = read(fds[MAXIMUM_NUMBER_OF_CLIENT_LISTENERS + 1].fd, &event, sizeof(event));
+                    my_assert(len != -1 || errno == EAGAIN, "reading fd_inotify");
+                }
+                read_all_files_into_memory();
+            }
+            else
+                write_a_log_line("inotify revents != POLLIN");
         }
     }
 }
 
 void mommy()
 {
+    write_a_log_line("mommy start");
     while (1)
     {
+        write_a_log_line("about to start child");
         if (!fork()) child();
         wait(NULL);
         usleep(1000000);    // wait for a second so we don't spin super quickly
@@ -298,14 +267,44 @@ void mommy()
 
 int main(int argc, char **argv)
 {
-    // e.g. local_file_server /path/
-    assert(argc == 2);
+    fprintf(stderr, "usage: %s absolute_path random_string\n", argv[0]);
+    fprintf(stderr, "     (e.g. %s /home/pi/ xxxxxx)\n", argv[0]);
+    
+    assert(argc == 3);
+    
+    char path[100];
     assert(strlen(argv[1]) + 1 + 1 <= sizeof(path));
     strcpy(path, argv[1]);
-    strcat(path, "/");
-    assert(mkdir(path, 0777) == 0 || errno == EEXIST);
-    printf("serving up files in %s on port 5874\n", path);
+    if (path[strlen(path)-1] != '/')
+        strcat(path, "/");
     
+    char key_path[100];
+    assert(strlen(path) + strlen(argv[2]) + 1 + 1 <= sizeof(key_path));
+    strcpy(key_path, path);
+    strcat(key_path, argv[2]);
+    strcat(key_path, "/");
+    
+    assert(strlen(key_path) + 7 + 1 <= sizeof(upload_path));
+    strcpy(upload_path, key_path);
+    strcat(upload_path, "upload/");
+    
+    assert(strlen(key_path) + 7 + 1 <= sizeof(logfile_path));
+    strcpy(logfile_path, key_path);
+    strcat(logfile_path, "local_file_server.log");
+    
+    fprintf(stderr, "\n---> this run: %s %s %s\n", argv[0], argv[1], argv[2]);
+    fprintf(stderr, "\nThe server watches the directory %s for new or modified files\n", upload_path);
+    fprintf(stderr, "ls -l -t -r %s | tail -5\n", upload_path);
+    fprintf(stderr, "\nThe log file is here: %s\n", logfile_path);
+    fprintf(stderr, "\ntail -f %s\n", logfile_path);
+
+    assert(mkdir(path, 0777) == 0 || errno == EEXIST);
+    assert(mkdir(key_path, 0777) == 0 || errno == EEXIST);
+    assert(mkdir(upload_path, 0777) == 0 || errno == EEXIST);
+
+    fprintf(stderr, "serving up files in %s on port 5874\n", path);
+    
+    write_a_log_line("about to start mommy");
     if (!fork()) mommy();
         return 0;
 }

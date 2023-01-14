@@ -70,8 +70,8 @@ typedef struct {
     int size_s3;    // the size in s3;
     int size_up;    // the size in upload directory;
     int size_down;    // the size in download directory;
-    time_t mod_time; // Time of last modification in upload directory
-    int wd; // inotify watch descriptor 
+//    time_t mod_time; // Time of last modification in upload directory
+//    int wd; // inotify watch descriptor 
 } obj_t;
 
 int upload_path_wd = -1; // inotify watch descriptor
@@ -109,8 +109,8 @@ obj_t *obj(const char *name)
     new_object.size_s3 = -1;
     new_object.size_up = -1;
     new_object.size_down = -1;
-    new_object.mod_time = 0;
-    new_object.wd = -1;
+//    new_object.mod_time = 0;
+//    new_object.wd = -1;
     
     // save the new object
     int object_offset = append(object_buffer, ((char *) (&new_object)), sizeof(obj_t));
@@ -490,16 +490,20 @@ void download_all_from_s3(void)
 
 int start_watching_upload_files(void)
 {
+    write_a_log_line("start_watching_upload_files start");
     int fd_inotify = inotify_init();
-    my_assert(fd_inotify > 0, "inotify_init");
-    
+    my_assert(fd_inotify != -1, "inotify_init");
+
+/*    
     DIR *dd = opendir(upload_path);
     my_assert(dd != NULL, "opendir");
-    
+*/
+  
     my_assert(upload_path_wd == -1, "upload_path_wd == -1");
-    upload_path_wd = inotify_add_watch(fd_inotify, upload_path, IN_CREATE);
-    my_assert(upload_path_wd > 0, "inotify_add_watch upload_path");
-
+    upload_path_wd = inotify_add_watch(fd_inotify, upload_path, IN_CREATE | IN_MOVED_TO | IN_MODIFY | IN_MASK_ADD);
+    my_assert(upload_path_wd != -1, "inotify_add_watch upload_path");
+    
+/*
     time_t now = time(NULL);
     
     struct dirent *de;
@@ -530,6 +534,8 @@ int start_watching_upload_files(void)
         }
     }
     my_assert(closedir(dd) == 0, "closedir");
+*/
+
     return fd_inotify;
 }
 
@@ -565,7 +571,7 @@ int files_not_equal(const char *d_name, const char *up_pathname, const char *dow
     if (stat(up_pathname, &statbufup) != 0) return 1;
     if (stat(down_pathname, &statbufdown) != 0) return 1;
 
-    obj(d_name)->mod_time = statbufup.st_mtime;
+//    obj(d_name)->mod_time = statbufup.st_mtime;
 
     if (statbufup.st_size != statbufdown.st_size) return 1;
     
@@ -580,8 +586,9 @@ int files_not_equal(const char *d_name, const char *up_pathname, const char *dow
     return memcmp(buffa, buffb, statbufup.st_size) ? 1 : 0;
 }
 
-void upload_to_s3_and_download_from_s3(void)
+int upload_to_s3_and_download_from_s3(void)
 {
+    int directories_did_not_match = 0;
     DIR *dd = opendir(upload_path);
     my_assert(dd != NULL, "opendir for upload");
     
@@ -602,19 +609,24 @@ void upload_to_s3_and_download_from_s3(void)
             if (files_not_equal(de->d_name, up_pathname, down_pathname))
             {
 //                printf("not equal\n");
+                directories_did_not_match = 1;
                 put_s3_object(de->d_name, up_pathname);
                 get_s3_object(de->d_name, down_pathname);
             }
         }
     }
     my_assert(closedir(dd) == 0, "closedir");
+    return directories_did_not_match;
 }
 
 void wait_for_file_to_change(int fd_inotify)
 {
     // Now wait for one of the files to change...
-    struct inotify_event event[100];
+    struct inotify_event event[sizeof(struct inotify_event) + NAME_MAX + 1];
+    my_assert(fd_inotify != -1, "fd_inotify != -1");
     my_assert(read(fd_inotify, &event, sizeof(event)) > 0, "reading fd_inotify");
+    
+    /*
     
     // something changed. what happened?
     // actually, come to think of it... we don't care what the event was - let's just loop around
@@ -642,18 +654,26 @@ void wait_for_file_to_change(int fd_inotify)
         obj_ptr->wd = -1;
     }
     my_assert(close(fd_inotify) == 0, "close fd_inotify");
+    
+    */
 }
 
 int child()
 {
-    write_a_log_line("child_start");
+    write_a_log_line("child start");
     
     download_all_from_s3();
-    upload_to_s3_and_download_from_s3();
+    int fd_inotify = start_watching_upload_files();
+    write_a_log_line("loop start");
     while (1)
     {
-        int fd_inotify = start_watching_upload_files();
-        upload_to_s3_and_download_from_s3();
+        int something_did_not_match = upload_to_s3_and_download_from_s3();
+        while (something_did_not_match)
+        {
+            something_did_not_match = upload_to_s3_and_download_from_s3();
+            if (something_did_not_match)
+                write_a_log_line("upload_to_s3_and_download_from_s3() didn't complete last time. running again!");
+        }
         // TODO pause here if the rolling average of bandwidth (over the last 24 hrs?) exceeds the limit
         // pause enough to bring the rolling average of the bandwidth back down below the limit
         wait_for_file_to_change(fd_inotify);
@@ -662,8 +682,10 @@ int child()
 
 void mommy()
 {
+    write_a_log_line("mommy start");
     while (1)
     {
+    write_a_log_line("about to start child");
         if (!fork()) child();
         wait(NULL);
         usleep(1000000);    // wait for a second so we don't spin super quickly
@@ -672,22 +694,23 @@ void mommy()
 
 int main(int argc, char **argv)
 {
-    // e.g. syncs3 /home/pi/ joeruff.com 2D4090
+    fprintf(stderr, "usage: %s absolute_path random_string aws_S3_bucket\n", argv[0]);
+    fprintf(stderr, "     (e.g. %s /home/pi/ xxxxxx joeruff.com)\n", argv[0]);
+    
     assert(argc == 4);
     
     char path[100];
     assert(strlen(argv[1]) + 1 + 1 <= sizeof(path));
     strcpy(path, argv[1]);
-    strcat(path, "/");
+    if (path[strlen(path)-1] != '/')
+        strcat(path, "/");
     
-    assert(mkdir(path, 0777) == 0 || errno == EEXIST);
-
-    assert(strlen(argv[2]) + 1 <= sizeof(bucket));
-    strcpy(bucket, argv[2]);
-
     char key[100];
-    assert(strlen(argv[3]) + 1 <= sizeof(key));
-    strcpy(key, argv[3]);
+    assert(strlen(argv[2]) + 1 <= sizeof(key));
+    strcpy(key, argv[2]);
+
+    assert(strlen(argv[3]) + 1 <= sizeof(bucket));
+    strcpy(bucket, argv[3]);
 
     assert(7 + strlen(key) + 7 + 1 <= sizeof(prefix));
     strcpy(prefix, "syncs3/");
@@ -701,24 +724,38 @@ int main(int argc, char **argv)
     strcat(key_path, key);
     strcat(key_path, "/");
     
-    assert(mkdir(key_path, 0777) == 0 || errno == EEXIST);
-    
     assert(strlen(key_path) + 7 + 1 <= sizeof(upload_path));
     strcpy(upload_path, key_path);
     strcat(upload_path, "upload/");
-    
-    assert(mkdir(upload_path, 0777) == 0 || errno == EEXIST);
     
     assert(strlen(key_path) + 9 + 1 <= sizeof(download_path));
     strcpy(download_path, key_path);
     strcat(download_path, "download/");
     
-    assert(mkdir(download_path, 0777) == 0 || errno == EEXIST);
-    
     assert(strlen(key_path) + 7 + 1 <= sizeof(logfile_path));
     strcpy(logfile_path, key_path);
-    strcat(logfile_path, "log.txt");
+    strcat(logfile_path, "syncs3.log");
     
+    fprintf(stderr, "\n---> this run: %s %s %s %s\n", argv[0], argv[1], argv[2], argv[3]);
+    fprintf(stderr, "\nThe server watches the directory %s for new or modified files\n", upload_path);
+    fprintf(stderr, "ls -l -t -r %s | tail -5\n", upload_path);
+    fprintf(stderr, "\nFirst, it copies any new or modified files to Amazon S3.\n");
+    fprintf(stderr, "    e.g. %sfile.txt is copied to s3://%s/%sfile.txt\n", upload_path, bucket, prefix);
+    fprintf(stderr, "/usr/bin/aws s3api list-objects --bucket %s --output json --prefix %s --max-items 10\n", bucket, prefix);
+    fprintf(stderr, "\nSecond, it copies the file from Amazon S3 to the download directory.\n");
+    fprintf(stderr, "    e.g. s3://%s/%sfile.txt is copied to %sfile.txt\n", bucket, prefix, download_path);
+    fprintf(stderr, "\nAny file which differs in the upload and download directories is copied again\n");
+    fprintf(stderr, "    if %sfile.txt != %sfile.txt\n", upload_path, download_path);
+    fprintf(stderr, "ls -l -t -r %s | tail -5\n", download_path);
+    fprintf(stderr, "\nThe log file is here: %s\n", logfile_path);
+    fprintf(stderr, "\ntail -f %s\n", logfile_path);
+
+    assert(mkdir(path, 0777) == 0 || errno == EEXIST);
+    assert(mkdir(key_path, 0777) == 0 || errno == EEXIST);
+    assert(mkdir(upload_path, 0777) == 0 || errno == EEXIST);
+    assert(mkdir(download_path, 0777) == 0 || errno == EEXIST);
+
+    write_a_log_line("about to start mommy");
     if (!fork()) mommy();
         return 0;
 }
